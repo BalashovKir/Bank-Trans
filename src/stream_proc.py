@@ -1,93 +1,105 @@
 import asyncio
 import json
-from datetime import datetime, time
 import os
+import sys
+from datetime import datetime
 from dotenv import load_dotenv
+from pathlib import Path
 
-# Загружаем переменные окружения
+# Добавляем путь к src в PYTHONPATH
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+src_path = str(Path(__file__).parent)
+if src_path not in sys.path:
+    sys.path.append(src_path)
+
+# Загружаем переменные окружения для email
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env.local'))
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
-from models import Transaction
-from alert_sender import MailtrapAlertSender  # Используем только MailtrapAlertSender
 
-class FraudDetector:
-    @staticmethod
-    def analyze(tx: Transaction) -> dict:
-        """Анализирует транзакцию по базовым правилам"""
-        alerts = []
-        
-        # Правило 1: Крупные суммы
-        if (tx.currency == "RUB" and tx.amount > 100_000) or \
-           (tx.currency in ["USD", "EUR"] and tx.amount > 10_000):
-            alerts.append("HIGH_AMOUNT")
-        
-        # Правило 2: Подозрительные валюты
-        crypto_currencies = ["XMR", "BTC", "USDT"]
-        if tx.currency in crypto_currencies:
-            alerts.append("CRYPTO_CURRENCY")
-        
-        # Правило 3: Ночные операции
-        if tx.timestamp.time() < time(6, 0) or tx.timestamp.time() > time(23, 59):
-            alerts.append("NIGHT_OPERATION")
-        
-        # Правило 4: Частые микротранзакции
-        if tx.microtransactions_count is not None and tx.microtransactions_count > 15:
-            alerts.append("MICROTRANSACTIONS_FLOOD")
-
-        return {
-            "is_suspicious": bool(alerts),
-            "alerts": alerts,
-            "risk_score": len(alerts) * 25
-        }
-
-async def setup_processing_environment():
-    producer = AIOKafkaProducer(bootstrap_servers="localhost:9092")
-    await producer.start()
+try:
+    from models import Transaction
+    from rule_engine import fraud_engine
+    from db import get_session
+    from crud import save_transaction
     try:
-        topics = producer.client.cluster.topics()
-        if "transactions" not in topics:
-            print("Инициализация топика для транзакций...")
-            await producer.client.create_topic("transactions", 1, 1)
-    finally:
-        await producer.stop()
+        from logger import logger
+    except ImportError:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.warning("Loguru not found, using standard logging")
+    from alert_sender import MailtrapAlertSender
+except ImportError as e:
+    print(f"Ошибка импорта: {e}")
+    print("Текущий sys.path:", sys.path)
+    raise
+
+BOOTSTRAP_SERVERS = [
+    'localhost:9092',   
+    'localhost:19092',    
+    'localhost:10092',
+    'localhost:11092',
+    '127.0.0.1:9092'      
+]
 
 async def process_transactions():
-    await setup_processing_environment()
+    # Инициализация системы оповещений
+    alert_sender = MailtrapAlertSender()
     
     consumer = AIOKafkaConsumer(
         "transactions",
-        bootstrap_servers="localhost:9092",
+        bootstrap_servers=BOOTSTRAP_SERVERS,
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-        group_id="fraud-detection-system",
+        group_id="mvp-consumer-group",
         request_timeout_ms=3000,
         session_timeout_ms=10000,
         heartbeat_interval_ms=3000
     )
     
-    # Инициализация системы оповещений
-    alert_sender = MailtrapAlertSender()
-    
     await consumer.start()
-    print("Система мониторинга транзакций запущена")
-    print("Ожидание входящих транзакций...")
+    logger.info("Успешно подключено к Kafka")
+    logger.info("Подписка на тему: transactions")
     
     try:
         async for msg in consumer:
             try:
                 tx_data = msg.value
-                tx_data['timestamp'] = datetime.fromisoformat(tx_data['timestamp'])
-                tx = Transaction(**tx_data)
-                result = FraudDetector.analyze(tx)
+                logger.info(f"Получена транзакция: {tx_data['id']}")
                 
+                # Конвертируем строку времени в datetime
+                if 'timestamp' in tx_data:
+                    tx_data['timestamp'] = datetime.fromisoformat(tx_data['timestamp'])
+                
+                tx = Transaction(**tx_data)
+                result = fraud_engine.analyze(tx)
+
+                # Временно отключено сохранение в БД
+                """
+                with get_session() as db:
+                    save_transaction(
+                        tx,
+                        db,
+                        is_suspicious=result["is_suspicious"],
+                        alerts=result["alerts"],
+                        risk_score=result["risk_score"]
+                    )
+                """
+
                 if result["is_suspicious"]:
-                    print(f"""
-                    🚨 Подозрительная транзакция [Риск: {result['risk_score']}%]
-                    ID: {tx.id}
-                    Сумма: {tx.amount:.2f} {tx.currency}
-                    Время: {tx.timestamp.strftime('%Y-%m-%d %H:%M:%S')}
-                    Причины: {", ".join(result['alerts'])}
-                    """)
+                    alert_message = (
+                        f"\n🚨 Подозрительная транзакция [Риск: {result['risk_score']}%]\n"
+                        f"ID: {tx.id}\n"
+                        f"Сумма: {tx.amount} {tx.currency}\n"
+                        f"Время: {tx.timestamp}\n"
+                        f"Причины: {', '.join(result['alerts'])}"
+                    )
+                    logger.warning(alert_message)
                     
                     # Подготовка данных для алерта
                     tx_data_for_alert = {
@@ -105,11 +117,15 @@ async def process_transactions():
                         result['risk_score']
                     )
                     
+            except json.JSONDecodeError as e:
+                logger.error(f"Неверный JSON: {e} | Данные: {msg.value}")
             except Exception as e:
-                print(f"Ошибка обработки: {e}")
+                logger.error(f"Ошибка обработки: {e}")
+    except Exception as e:
+        logger.critical(f"Ошибка подключения: {e}")
     finally:
         await consumer.stop()
-        print("Мониторинг остановлен")
+        logger.info("Обработчик остановлен")
 
 if __name__ == "__main__":
     asyncio.run(process_transactions())
